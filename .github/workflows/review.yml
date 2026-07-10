@@ -1,0 +1,70 @@
+name: AI PR Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      ai_provider:
+        description: 'LLM provider: openrouter, nvidia, or groq'
+        type: string
+        default: 'openrouter'
+      review_models:
+        description: 'Comma-separated model IDs for review passes'
+        type: string
+        default: 'deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash'
+      validator_model:
+        description: 'Model for validator pass'
+        type: string
+        default: 'deepseek/deepseek-v4-flash'
+      num_passes:
+        description: 'Number of parallel passes'
+        type: string
+        default: '3'
+      min_votes:
+        description: 'Minimum votes to keep a finding'
+        type: string
+        default: '2'
+      max_diff_lines:
+        description: 'Skip review if diff exceeds this many lines'
+        type: string
+        default: '5000'
+    secrets:
+      OPENROUTER_API_KEY:
+        required: false
+      NVIDIA_API_KEY:
+        required: false
+      GROQ_API_KEY:
+        required: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run AI Review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          AI_PROVIDER: ${{ inputs.ai_provider }}
+          REVIEW_MODELS: ${{ inputs.review_models }}
+          VALIDATOR_MODEL: ${{ inputs.validator_model }}
+          NUM_PASSES: ${{ inputs.num_passes }}
+          MIN_VOTES: ${{ inputs.min_votes }}
+          MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
+        run: |
+          curl -sSL https://raw.githubusercontent.com/rmichelena/ai-pr-reviewer/main/scripts/ai_review.py -o ai_review.py
+          python ai_review.py
