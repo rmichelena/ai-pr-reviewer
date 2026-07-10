@@ -21,7 +21,7 @@ All config via environment variables (GitHub Action inputs or repo secrets):
 - `AI_PROVIDER` — `openrouter` | `nvidia` | `groq` | `xai` (default: `openrouter`)
 - `REVIEW_MODELS` — comma-separated model IDs (default: deepseek-v4-flash x3)
 - `VALIDATOR_MODEL` — model for validator pass (default: same as review model)
-- `NUM_PASSES` — parallel passes (default: 3)
+- `NUM_PASSES` is no longer used — passes = number of models in `REVIEW_MODELS`
 - `MIN_VOTES` — minimum votes to keep a finding (default: 2)
 - `MAX_DIFF_LINES` — skip review if diff exceeds this (default: 5000)
 
