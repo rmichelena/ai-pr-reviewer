@@ -86,8 +86,14 @@ class Finding:
 
     @property
     def key(self) -> str:
-        """Dedup key: file + normalized title."""
-        return f"{self.file}::{self.title.lower().strip()[:80]}"
+        """Dedup key: normalized file + line + title hash.
+
+        Uses normalize_file_path so that a/src/foo.py and src/foo.py
+        produce the same key. Includes a short hash of the full title
+        to avoid collisions on long titles sharing a prefix.
+        """
+        title_hash = hashlib.md5(self.title.lower().strip().encode()).hexdigest()[:12]
+        return f"{normalize_file_path(self.file)}:{self.line}::{title_hash}"
 
     @classmethod
     def from_block(cls, block: str) -> "Finding | None":
@@ -95,7 +101,7 @@ class Finding:
 
         Supports multi-line field values: once a known field marker is seen,
         subsequent non-marker lines are appended to that field's value.
-        Only splits on lines starting with a known field name followed by '::'.
+        Duplicate field markers use last-wins semantics for scalar fields.
         """
         fields: dict[str, list[str]] = {}
         current_field: str | None = None
@@ -105,21 +111,37 @@ class Finding:
             if m and m.group(1).strip().lower() in KNOWN_FIELDS:
                 fname = m.group(1).strip().lower()
                 current_field = fname
-                fields.setdefault(fname, []).append(m.group(2).strip())
+                # Last-wins: replace if field already seen (handles LLM duplicates)
+                fields[fname] = [m.group(2).strip()]
             elif current_field:
-                # Continuation line — append to current field
-                fields[current_field].append(line.strip())
+                # Continuation line — but only if it doesn't look like a known field
+                # This prevents continuation lines like "file:: paths..." from
+                # being misinterpreted when they appear inside reasoning/fix text
+                if not FIELD_RE.match(line) or FIELD_RE.match(line).group(1).strip().lower() not in KNOWN_FIELDS:
+                    pass  # don't treat as continuation — ignore stray lines
+                # Continuation lines appended to current field value
+                if current_field in ("reasoning", "fix", "trace"):
+                    fields[current_field].append(line.strip())
             # else: ignore preamble lines before first field marker
 
         def get(name: str, default: str = "") -> str:
-            return " ".join(fields.get(name, [default])) if fields.get(name) else default
+            vals = fields.get(name)
+            if not vals:
+                return default
+            # Join multi-line values with space
+            return " ".join(vals)
+
+        # Extract first integer from line value (handles "42-45", "line 42", etc.)
+        line_str = get("line", "0")
+        line_match = re.search(r"\d+", line_str)
+        line_val = int(line_match.group()) if line_match else 0
 
         try:
             return cls(
                 severity=get("severity", "Low"),
                 title=get("title", "Untitled"),
-                file=get("file", ""),
-                line=int(get("line", "0") or "0"),
+                file=normalize_file_path(get("file", "")),
+                line=line_val,
                 reasoning=get("reasoning", ""),
                 fix=get("fix", ""),
                 trace=get("trace", "N/A"),
@@ -223,30 +245,65 @@ def build_file_line_map(diff: str) -> dict[str, dict[int, int]]:
 def normalize_file_path(path: str) -> str:
     """Normalize a file path from LLM output to match diff format.
 
-    Strips a/, b/, ./ prefixes that LLMs commonly add.
+    Strips surrounding quotes/backticks, then repeatedly removes
+    a/, b/, ./ prefixes until stable.
     """
     path = path.strip()
-    for prefix in ("a/", "b/", "./"):
-        if path.startswith(prefix):
-            path = path[len(prefix):]
-            break
+    # Strip surrounding markdown backticks and quotes
+    path = path.strip("`'\"")
+    # Repeatedly strip known prefixes (handles ./b/src/foo.py etc.)
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("a/", "b/", "./"):
+            if path.startswith(prefix):
+                path = path[len(prefix):]
+                changed = True
     return path
 
 
-def extract_file_hunk(diff: str, file_path: str, context_lines: int = 50) -> str:
-    """Extract the diff hunk(s) for a specific file, with surrounding context.
+def extract_file_hunk(diff: str, file_path: str, finding_line: int = 0, context_lines: int = 50) -> str:
+    """Extract the diff hunk(s) for a specific file, centered on finding_line.
 
-    Used to give the validator relevant context instead of a generic prefix.
+    Uses exact path matching from the hunk header to avoid matching
+    the wrong file. If finding_line is provided and the hunk is large,
+    extracts context around that line rather than always returning the top.
     """
+    norm_target = normalize_file_path(file_path)
     hunks = parse_hunks(diff)
     for hunk in hunks:
-        # Check if this hunk is for the target file
-        if file_path in hunk[:500]:  # File path appears in hunk header
-            lines = hunk.splitlines()
-            if len(lines) <= context_lines * 2:
-                return hunk
-            # Find the most relevant section (around the finding line if possible)
-            return "\n".join(lines[:context_lines * 2])
+        first_line = hunk.splitlines()[0] if hunk.splitlines() else ""
+        # Exact match on the b/ path from the diff header
+        m = re.search(r"diff --git a/(.+?) b/(.+)", first_line)
+        if not m:
+            continue
+        hunk_path = normalize_file_path(m.group(2))
+        if hunk_path != norm_target:
+            continue
+
+        lines = hunk.splitlines()
+        if len(lines) <= context_lines * 2:
+            return hunk
+
+        # If we know the finding line, center context around it
+        if finding_line > 0:
+            # Find the line in the hunk that mentions the target line number
+            # Look for the @@ header or content lines near the finding
+            best_idx = 0
+            for i, hline in enumerate(lines):
+                # Check if this hunk line corresponds to the finding line
+                if hline.startswith("@@"):
+                    hm = re.search(r"\+(\d+)", hline)
+                    if hm:
+                        hunk_start = int(hm.group(1))
+                        if abs(hunk_start - finding_line) < context_lines:
+                            best_idx = max(0, i - 5)
+                            break
+            start = max(0, best_idx - context_lines // 2)
+            end = min(len(lines), start + context_lines * 2)
+            return "\n".join(lines[start:end])
+
+        return "\n".join(lines[:context_lines * 2])
     return ""
 
 
@@ -312,8 +369,10 @@ def call_llm(
             r = requests.post(url, headers=headers, json=body, timeout=120)
             if r.status_code == 429:
                 wait = _safe_retry_after(r.headers.get("retry-after"))
+                # Add jitter to prevent thundering herd with parallel passes
+                wait += random.uniform(0.5, 2.0)
                 last_error = f"HTTP 429 rate limited (retry-after: {r.headers.get('retry-after', 'N/A')})"
-                print(f"  Rate limited, waiting {wait}s...")
+                print(f"  Rate limited, waiting {wait:.1f}s...")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
@@ -513,9 +572,12 @@ def post_review_with_fallback(
     body: str,
     comments: list[dict[str, Any]],
     commit_id: str = "",
+    comment_details: list[str] | None = None,
 ) -> bool:
     """Post a PR review, falling back to body-only if inline comments fail.
 
+    If comment_details is provided, they are appended to the body in the
+    fallback path so finding reasoning/fix/trace are not lost.
     Returns True if review was posted (with or without inline comments).
     """
     # First attempt: full review with inline comments
@@ -526,9 +588,16 @@ def post_review_with_fallback(
         print(f"  ⚠️ Full review failed: {e}")
         print(f"  Falling back to body-only review (no inline comments)...")
 
-    # Fallback: post body only, append finding details to body
+    # Build enriched body with full finding details for fallback
+    fallback_body = body
+    if comment_details:
+        fallback_body += "\n\n<details>\n<summary>📋 Finding details</summary>\n\n"
+        fallback_body += "\n\n---\n".join(comment_details)
+        fallback_body += "\n\n</details>"
+
+    # Fallback: post body only with enriched details
     try:
-        post_review(pr_number, repo, token, body, [], commit_id)
+        post_review(pr_number, repo, token, fallback_body, [], commit_id)
         return True
     except requests.RequestException as e:
         print(f"  ❌ Body-only review also failed: {e}")
@@ -620,6 +689,8 @@ class ValidationResult:
     finding: Finding
     dismissed: bool
     error: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
+    cost: float = 0.0
 
 
 def run_validation(
@@ -628,12 +699,14 @@ def run_validation(
     validator_model: str,
 ) -> ValidationResult:
     """Validate a single finding. Designed to be called in parallel."""
-    file_hunk = extract_file_hunk(diff, finding.file)
+    file_hunk = extract_file_hunk(diff, finding.file, finding_line=finding.line)
     v_prompt = build_validator_prompt(finding, file_hunk)
     try:
-        v_text, _ = call_llm(validator_model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
+        v_text, v_usage = call_llm(validator_model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
     except LLMError as e:
         return ValidationResult(finding, dismissed=False, error=str(e))
+
+    cost = estimate_cost(validator_model, v_usage)
 
     # Parse verdict line specifically, not substring match
     m = re.search(r"verdict\s*::\s*(KEEP|DISMISS)", v_text, re.IGNORECASE)
@@ -643,7 +716,7 @@ def run_validation(
         # If we can't parse, default to KEEP (safer)
         dismissed = False
 
-    return ValidationResult(finding, dismissed=dismissed)
+    return ValidationResult(finding, dismissed=dismissed, usage=v_usage, cost=cost)
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +801,13 @@ def main() -> None:
             if result.error:
                 failed_passes += 1
                 continue
+            # Dedup findings within this pass before voting (prevents LLM
+            # duplicates from inflating vote counts)
+            seen_in_pass: set[str] = set()
             for f in result.findings:
+                if f.key in seen_in_pass:
+                    continue
+                seen_in_pass.add(f.key)
                 if f.key in all_findings:
                     all_findings[f.key].votes += 1
                 else:
@@ -771,9 +850,12 @@ def main() -> None:
                     continue
 
                 if vr.error:
-                    total_cost += 0  # validator cost tracked inside run_validation if needed
                     print(f"  ⚠️ Validator failed for '{finding.title}', keeping: {vr.error}")
                     continue
+
+                total_cost += vr.cost
+                for k in total_usage:
+                    total_usage[k] += vr.usage.get(k, 0)
 
                 if vr.dismissed:
                     finding.validated = False
@@ -863,10 +945,21 @@ def main() -> None:
         print("Review with same findings already posted for this commit, skipping.")
         return
 
+    # --- Collect comment details for fallback body ---
+    comment_details = []
+    for f in final:
+        emoji = severity_emoji.get(f.severity, "⚪")
+        detail = f"{emoji} **{f.severity}: {f.title}** (`{f.file}:{f.line}`)\n\n"
+        detail += f"{f.reasoning}\n\n**Fix:** {f.fix}\n"
+        if f.trace and f.trace != "N/A":
+            detail += f"\n**Trace:** `{f.trace}`\n"
+        comment_details.append(detail)
+
     # --- Post with fallback ---
     review_body = "\n".join(body_lines)
     posted = post_review_with_fallback(
-        pr_number, repo, token, review_body, valid_comments, commit_id=head_sha)
+        pr_number, repo, token, review_body, valid_comments,
+        commit_id=head_sha, comment_details=comment_details)
 
     if posted:
         print(f"\n✅ Review posted. Total cost: ${total_cost:.4f}")
