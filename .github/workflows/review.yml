@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       ai_provider:
-        description: 'LLM provider: openrouter, nvidia, or groq'
+        description: 'LLM provider: openrouter, nvidia, groq, or xai'
         type: string
         default: 'openrouter'
       review_models:
@@ -15,10 +15,6 @@ on:
         description: 'Model for validator pass'
         type: string
         default: 'deepseek/deepseek-v4-flash'
-      num_passes:
-        description: 'Number of parallel passes'
-        type: string
-        default: '3'
       min_votes:
         description: 'Minimum votes to keep a finding'
         type: string
@@ -33,6 +29,8 @@ on:
       NVIDIA_API_KEY:
         required: false
       GROQ_API_KEY:
+        required: false
+      XAI_API_KEY:
         required: false
 
 jobs:
@@ -59,10 +57,10 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           AI_PROVIDER: ${{ inputs.ai_provider }}
           REVIEW_MODELS: ${{ inputs.review_models }}
           VALIDATOR_MODEL: ${{ inputs.validator_model }}
-          NUM_PASSES: ${{ inputs.num_passes }}
           MIN_VOTES: ${{ inputs.min_votes }}
           MAX_DIFF_LINES: ${{ inputs.max_diff_lines }}
         run: |

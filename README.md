@@ -17,8 +17,8 @@ All config via environment variables (GitHub Action inputs or repo secrets):
 
 - `OPENROUTER_API_KEY` — OpenRouter API key (required if using OpenRouter)
 - `NVIDIA_API_KEY` — NVIDIA NIM API key (required if using NVIDIA)
-- `GROQ_API_KEY` — Groq API key (required if using Groq)
-- `AI_PROVIDER` — `openrouter` | `nvidia` | `groq` (default: `openrouter`)
+- `XAI_API_KEY` — x.ai API key (required if using xai provider)
+- `AI_PROVIDER` — `openrouter` | `nvidia` | `groq` | `xai` (default: `openrouter`)
 - `REVIEW_MODELS` — comma-separated model IDs (default: deepseek-v4-flash x3)
 - `VALIDATOR_MODEL` — model for validator pass (default: same as review model)
 - `NUM_PASSES` — parallel passes (default: 3)

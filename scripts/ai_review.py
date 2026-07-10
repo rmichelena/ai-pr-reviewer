@@ -10,13 +10,15 @@ Requires: requests, GITHUB_TOKEN, and at least one provider API key.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
 import re
 import sys
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any
 
 import requests
@@ -52,7 +54,24 @@ PROVIDERS = {
         "key_prefix": "Bearer ",
         "extra_headers": {},
     },
+    "xai": {
+        "base_url": "https://api.x.ai/v1",
+        "key_env": "XAI_API_KEY",
+        "key_header": "Authorization",
+        "key_prefix": "Bearer ",
+        "extra_headers": {},
+    },
 }
+
+
+# ---------------------------------------------------------------------------
+# Finding model
+# ---------------------------------------------------------------------------
+
+# Known field names for parsing — ensures we only split on real field markers
+FIELD_RE = re.compile(
+    r"^(?:severity|title|file|line|reasoning|fix|trace)::\s*(.*)", re.IGNORECASE
+)
 
 
 @dataclass
@@ -74,12 +93,17 @@ class Finding:
 
     @classmethod
     def from_block(cls, block: str) -> "Finding | None":
-        """Parse a ===FINDING=== block."""
+        """Parse a ===FINDING=== block.
+
+        Only splits on lines starting with a known field name followed by '::'.
+        This prevents false splits when field values contain '::'.
+        """
         fields: dict[str, str] = {}
         for line in block.strip().splitlines():
-            if "::" in line:
-                k, _, v = line.partition("::")
-                fields[k.strip().lower()] = v.strip()
+            m = FIELD_RE.match(line)
+            if m:
+                fname = line.split("::")[0].strip().lower()
+                fields[fname] = m.group(1).strip()
         try:
             return cls(
                 severity=fields.get("severity", "Low"),
@@ -92,18 +116,6 @@ class Finding:
             )
         except (ValueError, TypeError):
             return None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "severity": self.severity,
-            "title": self.title,
-            "file": self.file,
-            "line": self.line,
-            "reasoning": self.reasoning,
-            "fix": self.fix,
-            "trace": self.trace,
-            "votes": self.votes,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +138,7 @@ def fetch_diff(pr_number: int, repo: str, token: str) -> str:
 
 
 def parse_hunks(diff: str) -> list[str]:
-    """Split a unified diff into hunks (one per file-change block)."""
+    """Split a unified diff into per-file hunks."""
     hunks: list[str] = []
     current: list[str] = []
     for line in diff.splitlines(keepends=True):
@@ -156,9 +168,56 @@ def count_diff_lines(diff: str) -> int:
     )
 
 
+def build_file_line_map(diff: str) -> dict[str, dict[int, int]]:
+    """Map file paths → {file_line_number: diff_position}.
+
+    Parses unified diff hunk headers (`@@ -a,b +c,d @@`) to compute
+    the GitHub diff position for each file line. The position is the
+    line number within the diff patch text (1-based), which is what
+    the GitHub PR review API expects.
+    """
+    result: dict[str, dict[int, int]] = {}
+    current_file: str | None = None
+    new_line = 0
+    diff_pos = 0
+
+    for line in diff.splitlines():
+        diff_pos += 1
+        if line.startswith("diff --git"):
+            m = re.search(r"diff --git a/(.+?) b/(.+)", line)
+            if m:
+                current_file = m.group(2)
+                result[current_file] = {}
+            continue
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            result.setdefault(current_file, {})
+            continue
+        if line.startswith("@@"):
+            m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if m:
+                new_line = int(m.group(1))
+            continue
+        if current_file is None:
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            result[current_file][new_line] = diff_pos
+            new_line += 1
+        elif line.startswith(" "):
+            result[current_file][new_line] = diff_pos
+            new_line += 1
+        # '-' lines don't advance new_line
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # LLM calls
 # ---------------------------------------------------------------------------
+
+class LLMError(Exception):
+    """Raised when all retry attempts fail."""
+
 
 def call_llm(
     model: str,
@@ -168,13 +227,17 @@ def call_llm(
     max_tokens: int = 8000,
     temperature: float = 0.3,
 ) -> tuple[str, dict[str, int]]:
-    """Call a model via the configured provider. Returns (response_text, usage)."""
+    """Call a model via the configured provider.
+
+    Returns (response_text, usage_dict).
+    Raises LLMError if all retries fail.
+    """
     provider_name = os.environ.get("AI_PROVIDER", "openrouter")
     provider = PROVIDERS.get(provider_name, PROVIDERS["openrouter"])
     key = os.environ.get(provider["key_env"], "")
 
     if not key:
-        raise RuntimeError(f"Missing {provider['key_env']} for provider {provider_name}")
+        raise LLMError(f"Missing {provider['key_env']} for provider {provider_name}")
 
     url = f"{provider['base_url']}/chat/completions"
     headers = {
@@ -193,6 +256,7 @@ def call_llm(
         "temperature": temperature,
     }
 
+    last_error = ""
     for attempt in range(3):
         try:
             r = requests.post(url, headers=headers, json=body, timeout=120)
@@ -211,11 +275,12 @@ def call_llm(
                 "total_tokens": usage.get("total_tokens", 0),
             }
         except requests.RequestException as e:
+            last_error = str(e)
             print(f"  LLM call attempt {attempt+1} failed: {e}")
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
 
-    return "", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    raise LLMError(f"Model {model} failed after 3 retries: {last_error}")
 
 
 FINDING_RE = re.compile(r"===FINDING===(.*?)===END_FINDING===", re.DOTALL)
@@ -305,8 +370,11 @@ def build_validator_prompt(finding: Finding, diff: str) -> str:
 # GitHub posting
 # ---------------------------------------------------------------------------
 
-def get_existing_review_bodies(pr_number: int, repo: str, token: str) -> set[str]:
-    """Get set of existing review comment bodies to avoid duplicates."""
+def get_existing_review_fingerprints(pr_number: int, repo: str, token: str) -> set[str]:
+    """Get set of review fingerprints to avoid duplicates.
+
+    Uses a hidden HTML comment marker embedded in review bodies.
+    """
     url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/reviews"
     r = requests.get(
         url,
@@ -315,12 +383,14 @@ def get_existing_review_bodies(pr_number: int, repo: str, token: str) -> set[str
     )
     if not r.ok:
         return set()
-    bodies = set()
+    fingerprints = set()
     for review in r.json():
         body = review.get("body", "")
-        if body:
-            bodies.add(body[:200])
-    return bodies
+        # Extract hidden marker: <!--review-fingerprint:abc123-->
+        m = re.search(r"<!--review-fingerprint:([a-f0-9]+)-->", body)
+        if m:
+            fingerprints.add(m.group(1))
+    return fingerprints
 
 
 def post_review(
@@ -347,17 +417,6 @@ def post_review(
     print(f"  Posted review with {len(comments)} inline comments")
 
 
-def get_pr_info(pr_number: int, repo: str, token: str) -> dict[str, Any]:
-    url = f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}"
-    r = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
 def load_review_rules() -> str:
     """Load .github/review-rules.md if present."""
     for path in (".github/review-rules.md", "REVIEW_RULES.md"):
@@ -365,17 +424,6 @@ def load_review_rules() -> str:
             with open(path) as f:
                 return f.read()
     return ""
-
-
-def diff_line_to_position(diff_text: str, file_path: str, line: int) -> int | None:
-    """Best-effort: map a file line number to a diff position for GitHub comments.
-
-    GitHub wants the line number within the diff hunk, not the file.
-    This is a simplified mapper that finds the right hunk.
-    """
-    # For now, we pass line as-is (GitHub accepts file line for single-hunk files)
-    # A more robust solution parses the diff hunk headers
-    return max(line, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +438,9 @@ MODEL_PRICING = {
     "xiaomi/mimo-v2.5": (0.105, 0.28),
     "zai/glm-5.2": (0.42, 1.32),
     "stepfun/step-3.7-flash": (0.20, 1.15),
+    # x.ai — grok-4-5 is free for a limited time, but list nominal pricing
+    "grok-4-5": (0.0, 0.0),
+    "grok-4-5-fast": (0.0, 0.0),
 }
 
 
@@ -403,6 +454,46 @@ def estimate_cost(model: str, usage: dict[str, int]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Single review pass (for parallel execution)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PassResult:
+    findings: list[Finding]
+    usage: dict[str, int]
+    cost: float
+    model: str
+    error: str | None = None
+
+
+def run_review_pass(
+    pass_index: int,
+    model: str,
+    hunks: list[str],
+    rules: str,
+    pr_title: str,
+) -> PassResult:
+    """Run a single review pass. Designed to be called in parallel."""
+    print(f"\n--- Pass {pass_index+1}: {model} ---")
+    shuffled = shuffle_hunks(hunks, seed=pass_index * 42 + 7)
+    if len(shuffled) > 100_000:
+        shuffled = shuffled[:100_000] + "\n... (truncated)\n"
+
+    user_msg = build_review_prompt(shuffled, rules, pr_title)
+    try:
+        text, usage = call_llm(model, SYSTEM_PROMPT, user_msg)
+    except LLMError as e:
+        print(f"  ❌ Pass {pass_index+1} failed: {e}")
+        return PassResult([], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                         0.0, model, error=str(e))
+
+    cost = estimate_cost(model, usage)
+    findings = parse_findings(text)
+    print(f"  Found {len(findings)} findings, cost ${cost:.4f}")
+    return PassResult(findings, usage, cost, model)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -411,7 +502,10 @@ def main() -> None:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     event_path = os.environ.get("GITHUB_EVENT_PATH", "")
     token = os.environ.get("GITHUB_TOKEN", "")
-    models_str = os.environ.get("REVIEW_MODELS", "deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash")
+    models_str = os.environ.get(
+        "REVIEW_MODELS",
+        "deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash",
+    )
     validator_model = os.environ.get("VALIDATOR_MODEL", "deepseek/deepseek-v4-flash")
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
@@ -454,52 +548,60 @@ def main() -> None:
     all_findings: dict[str, Finding] = {}
     total_cost = 0.0
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    failed_passes = 0
 
-    for i, model in enumerate(models):
-        print(f"\n--- Pass {i+1}/{len(models)}: {model} ---")
-        shuffled = shuffle_hunks(hunks, seed=i * 42 + 7)
-        # Truncate diff if extremely long (per-pass)
-        if len(shuffled) > 100_000:
-            shuffled = shuffled[:100_000] + "\n... (truncated)\n"
+    with ThreadPoolExecutor(max_workers=len(models)) as pool:
+        futures = {
+            pool.submit(run_review_pass, i, model, hunks, rules, pr_title): i
+            for i, model in enumerate(models)
+        }
+        for future in as_completed(futures):
+            result: PassResult = future.result()
+            total_cost += result.cost
+            for k in total_usage:
+                total_usage[k] += result.usage.get(k, 0)
+            if result.error:
+                failed_passes += 1
+                continue
+            for f in result.findings:
+                if f.key in all_findings:
+                    all_findings[f.key].votes += 1
+                else:
+                    f.votes = 1
+                    all_findings[f.key] = f
 
-        user_msg = build_review_prompt(shuffled, rules, pr_title)
-        text, usage = call_llm(model, SYSTEM_PROMPT, user_msg)
+    successful_passes = len(models) - failed_passes
+    print(f"\n=== Pre-vote: {len(all_findings)} unique findings ({failed_passes} passes failed) ===")
 
-        cost = estimate_cost(model, usage)
-        total_cost += cost
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
-
-        findings = parse_findings(text)
-        print(f"  Found {len(findings)} findings, cost ${cost:.4f}")
-
-        for f in findings:
-            if f.key in all_findings:
-                all_findings[f.key].votes += 1
-            else:
-                f.votes = 1
-                all_findings[f.key] = f
-
-    print(f"\n=== Pre-vote: {len(all_findings)} unique findings ===")
+    if failed_passes == len(models):
+        print("❌ All passes failed. Aborting review.")
+        post_review(pr_number, repo, token,
+                    "🤖 **AI Review failed** — all model passes encountered errors.", [])
+        return
 
     # --- Majority vote ---
-    voted = {k: f for k, f in all_findings.items() if f.votes >= min_votes}
-    print(f"=== Post-vote (≥{min_votes} votes): {len(voted)} findings ===")
+    # Adjust min_votes if some passes failed
+    effective_min_votes = min(min_votes, successful_passes)
+    voted = {k: f for k, f in all_findings.items() if f.votes >= effective_min_votes}
+    print(f"=== Post-vote (≥{effective_min_votes} votes of {successful_passes} successful): {len(voted)} findings ===")
 
     if not voted:
         print("No findings survived majority vote.")
 
     # --- Validator pass ---
     findings_list = list(voted.values())
-    # Truncate diff for validator
     diff_snippet = diff[:20_000]
 
     for finding in findings_list:
         v_prompt = build_validator_prompt(finding, diff_snippet)
-        v_text, v_usage = call_llm(validator_model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
-        total_cost += estimate_cost(validator_model, v_usage)
-        for k in total_usage:
-            total_usage[k] += v_usage.get(k, 0)
+        try:
+            v_text, v_usage = call_llm(validator_model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
+            total_cost += estimate_cost(validator_model, v_usage)
+            for k in total_usage:
+                total_usage[k] += v_usage.get(k, 0)
+        except LLMError as e:
+            print(f"  ⚠️ Validator failed for '{finding.title}', keeping by default: {e}")
+            continue
 
         if "DISMISS" in v_text.upper():
             finding.validated = False
@@ -512,20 +614,25 @@ def main() -> None:
 
     print(f"\n=== Final: {len(final)} validated findings ===")
 
+    # --- Build review fingerprint for dedup ---
+    fingerprint_data = sorted(f"{f.file}:{f.line}:{f.title}" for f in final)
+    fingerprint = hashlib.sha256("\n".join(fingerprint_data).encode()).hexdigest()[:16]
+
     # --- Build review body ---
     severity_emoji = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🔵"}
 
     body_lines = [
         f"## 🤖 AI PR Review",
         f"",
-        f"**{len(final)} finding(s)** after {len(models)} parallel passes + validation.",
+        f"<!--review-fingerprint:{fingerprint}-->",
+        f"",
+        f"**{len(final)} finding(s)** after {successful_passes}/{len(models)} parallel passes + validation.",
         f"",
     ]
 
     if final:
         body_lines.append("| Severity | File | Issue |")
         body_lines.append("|----------|------|-------|")
-        # Note: GitHub renders tables in PR reviews, unlike Discord
         for f in final:
             emoji = severity_emoji.get(f.severity, "⚪")
             body_lines.append(f"| {emoji} {f.severity} | `{f.file}:{f.line}` | {f.title} |")
@@ -540,11 +647,10 @@ def main() -> None:
         f"**Models:** {', '.join(models)} · Validator: {validator_model}",
     ])
 
-    # --- Build inline comments ---
-    pr_info = get_pr_info(pr_number, repo, token)
+    # --- Build inline comments using line/side API ---
+    file_line_map = build_file_line_map(diff)
     comments = []
     for f in final:
-        position = diff_line_to_position(diff, f.file, f.line)
         comment_body = (
             f"{severity_emoji.get(f.severity, '⚪')} **{f.severity}: {f.title}**\n\n"
             f"{f.reasoning}\n\n"
@@ -552,18 +658,21 @@ def main() -> None:
         )
         if f.trace and f.trace != "N/A":
             comment_body += f"**Trace:** `{f.trace}`\n\n"
-        comment_body += f"_(votes: {f.votes}/{len(models)}, validated ✅)_"
+        comment_body += f"_(votes: {f.votes}/{successful_passes}, validated ✅)_"
 
-        comments.append({
+        comment: dict[str, Any] = {
             "path": f.file,
-            "position": position,
             "body": comment_body,
-        })
+            "line": max(f.line, 1),
+            "side": "RIGHT",
+            "subject_type": "line",
+        }
+        comments.append(comment)
 
     # --- Dedup against existing reviews ---
-    existing = get_existing_review_bodies(pr_number, repo, token)
-    if any(body[:200] in existing for body in ["\n".join(body_lines)]):
-        print("Review already posted, skipping.")
+    existing_fps = get_existing_review_fingerprints(pr_number, repo, token)
+    if fingerprint in existing_fps:
+        print("Review with same findings already posted, skipping.")
         return
 
     # --- Post ---
