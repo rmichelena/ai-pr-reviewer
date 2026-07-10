@@ -78,12 +78,16 @@ MODEL_PROVIDER_PREFIXES = {
 def resolve_provider(model_id: str) -> tuple[str, str, str | None]:
     """Resolve a model ID to (provider_name, api_model_name, error).
 
-    Auto-detects the provider from the model ID prefix:
-      nvidia/deepseek-v4-flash    → ("nvidia", "deepseek-v4-flash", None)
-      openrouter/deepseek/...     → ("openrouter", "deepseek/...", None)
-      xai/grok-4-5                → ("xai", "grok-4-5", None)
-      groq/llama-3.3-70b          → ("groq", "llama-3.3-70b", None)
-      deepseek/deepseek-v4-flash  → falls back to AI_PROVIDER env var
+    Auto-detects the provider from the FIRST segment of the model ID:
+      nvidia/z-ai/glm-5.2              → ("nvidia", "z-ai/glm-5.2", None)
+      nvidia/nvidia/nemotron-3-ultra   → ("nvidia", "nvidia/nemotron-3-ultra", None)
+      openrouter/deepseek/deepseek-... → ("openrouter", "deepseek/deepseek-...", None)
+      xai/grok-4.5                     → ("xai", "grok-4.5", None)
+      groq/llama-3.3-70b               → ("groq", "llama-3.3-70b", None)
+      deepseek/deepseek-v4-flash       → falls back to AI_PROVIDER env var
+
+    The provider prefix is only the first segment (before the first /).
+    Everything after it is the API model name passed to that provider.
 
     Returns the provider name, the model name to send to that provider's API,
     and an error string if the provider's API key is missing.
@@ -711,15 +715,20 @@ def load_review_rules() -> str:
 # ---------------------------------------------------------------------------
 
 MODEL_PRICING = {
-    # Per 1M tokens (input, output) — keyed by model name without provider prefix
-    "deepseek-v4-flash": (0.084, 0.168),
-    "deepseek-v4-pro": (0.435, 0.87),
-    "hy3-preview": (0.063, 0.21),
-    "mimo-v2.5": (0.105, 0.28),
-    "glm-5.2": (0.42, 1.32),
-    "step-3.7-flash": (0.20, 1.15),
+    # Per 1M tokens (input, output) — keyed by API model name (after provider prefix strip)
+    "deepseek-ai/deepseek-v4-flash": (0.084, 0.168),
+    "deepseek-ai/deepseek-v4-pro": (0.435, 0.87),
+    "deepseek/deepseek-v4-flash": (0.084, 0.168),
+    "deepseek/deepseek-v4-pro": (0.435, 0.87),
+    "tencent/hy3-preview": (0.063, 0.21),
+    "xiaomi/mimo-v2.5": (0.105, 0.28),
+    "z-ai/glm-5.2": (0.42, 1.32),
+    "zai/glm-5.2": (0.42, 1.32),
+    "stepfun/step-3.7-flash": (0.20, 1.15),
     "grok-4.5": (0.0, 0.0),
     "grok-4.5-fast": (0.0, 0.0),
+    # NVIDIA hosted — free tier
+    "nvidia/nemotron-3-ultra-550b-a55b": (0.0, 0.0),
 }
 
 
@@ -834,9 +843,9 @@ def main() -> None:
     token = os.environ.get("GITHUB_TOKEN", "")
     models_str = os.environ.get(
         "REVIEW_MODELS",
-        "nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash",
+        "nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash",
     )
-    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-v4-flash")
+    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-ai/deepseek-v4-flash")
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
 
