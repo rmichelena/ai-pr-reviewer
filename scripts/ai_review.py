@@ -63,6 +63,50 @@ PROVIDERS = {
     },
 }
 
+# Prefix → provider mapping for auto-detection from model IDs.
+# Model IDs starting with one of these prefixes route to that provider.
+# The prefix is stripped before sending the model name to the API.
+# Unprefixed model IDs fall back to AI_PROVIDER env var (default: openrouter).
+MODEL_PROVIDER_PREFIXES = {
+    "nvidia/": "nvidia",
+    "openrouter/": "openrouter",
+    "xai/": "xai",
+    "groq/": "groq",
+}
+
+
+def resolve_provider(model_id: str) -> tuple[str, str, str | None]:
+    """Resolve a model ID to (provider_name, api_model_name, error).
+
+    Auto-detects the provider from the model ID prefix:
+      nvidia/deepseek-v4-flash    → ("nvidia", "deepseek-v4-flash", None)
+      openrouter/deepseek/...     → ("openrouter", "deepseek/...", None)
+      xai/grok-4-5                → ("xai", "grok-4-5", None)
+      groq/llama-3.3-70b          → ("groq", "llama-3.3-70b", None)
+      deepseek/deepseek-v4-flash  → falls back to AI_PROVIDER env var
+
+    Returns the provider name, the model name to send to that provider's API,
+    and an error string if the provider's API key is missing.
+    """
+    provider_name = os.environ.get("AI_PROVIDER", "openrouter")
+    api_model = model_id
+
+    for prefix, pname in MODEL_PROVIDER_PREFIXES.items():
+        if model_id.startswith(prefix):
+            provider_name = pname
+            api_model = model_id[len(prefix):]
+            break
+
+    provider = PROVIDERS.get(provider_name, PROVIDERS["openrouter"])
+    key = os.environ.get(provider["key_env"], "")
+    if not key:
+        return provider_name, api_model, (
+            f"Missing {provider['key_env']} for provider '{provider_name}' "
+            f"(needed by model '{model_id}')"
+        )
+
+    return provider_name, api_model, None
+
 # Known field names for parsing — ensures we only split on real field markers
 KNOWN_FIELDS = {"severity", "title", "file", "line", "reasoning", "fix", "trace"}
 FIELD_RE = re.compile(r"^(\w+)::\s*(.*)")
@@ -369,24 +413,31 @@ def _safe_retry_after(header_val: str | None) -> int:
 
 
 def call_llm(
-    model: str,
+    model_id: str,
     system: str,
     user: str,
     *,
     max_tokens: int = 8000,
     temperature: float = 0.3,
 ) -> tuple[str, dict[str, int]]:
-    """Call a model via the configured provider.
+    """Call a model via the auto-detected provider.
+
+    The provider is determined by the model ID prefix:
+      nvidia/...  → NVIDIA NIM
+      openrouter/... → OpenRouter
+      xai/...     → x.ai
+      groq/...    → Groq
+      (unprefixed) → AI_PROVIDER env var (default: openrouter)
 
     Returns (response_text, usage_dict).
     Raises LLMError if all retries fail.
     """
-    provider_name = os.environ.get("AI_PROVIDER", "openrouter")
-    provider = PROVIDERS.get(provider_name, PROVIDERS["openrouter"])
-    key = os.environ.get(provider["key_env"], "")
+    provider_name, api_model, key_error = resolve_provider(model_id)
+    if key_error:
+        raise LLMError(key_error)
 
-    if not key:
-        raise LLMError(f"Missing {provider['key_env']} for provider {provider_name}")
+    provider = PROVIDERS[provider_name]
+    key = os.environ.get(provider["key_env"], "")
 
     url = f"{provider['base_url']}/chat/completions"
     headers = {
@@ -396,7 +447,7 @@ def call_llm(
     }
 
     body = {
-        "model": model,
+        "model": api_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -432,7 +483,7 @@ def call_llm(
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
 
-    raise LLMError(f"Model {model} failed after 3 retries: {last_error}")
+    raise LLMError(f"Model {model_id} (via {provider_name}) failed after 3 retries: {last_error}")
 
 
 FINDING_RE = re.compile(r"===FINDING===(.*?)===END_FINDING===", re.DOTALL)
@@ -660,22 +711,33 @@ def load_review_rules() -> str:
 # ---------------------------------------------------------------------------
 
 MODEL_PRICING = {
-    # OpenRouter prices per 1M tokens (input, output)
-    "deepseek/deepseek-v4-flash": (0.084, 0.168),
-    "deepseek/deepseek-v4-pro": (0.435, 0.87),
-    "tencent/hy3-preview": (0.063, 0.21),
-    "xiaomi/mimo-v2.5": (0.105, 0.28),
-    "zai/glm-5.2": (0.42, 1.32),
-    "stepfun/step-3.7-flash": (0.20, 1.15),
-    # x.ai — grok-4-5 is free for a limited time, but list nominal pricing
+    # Per 1M tokens (input, output) — keyed by model name without provider prefix
+    "deepseek-v4-flash": (0.084, 0.168),
+    "deepseek-v4-pro": (0.435, 0.87),
+    "hy3-preview": (0.063, 0.21),
+    "mimo-v2.5": (0.105, 0.28),
+    "glm-5.2": (0.42, 1.32),
+    "step-3.7-flash": (0.20, 1.15),
     "grok-4-5": (0.0, 0.0),
     "grok-4-5-fast": (0.0, 0.0),
 }
 
 
-def estimate_cost(model: str, usage: dict[str, int]) -> float:
-    """Estimate USD cost for a model call."""
-    in_price, out_price = MODEL_PRICING.get(model, (0.10, 0.20))
+def estimate_cost(model_id: str, usage: dict[str, int]) -> float:
+    """Estimate USD cost for a model call.
+
+    Looks up pricing by the full model ID (with provider prefix) first,
+    then by the stripped model name.
+    """
+    in_price, out_price = MODEL_PRICING.get(model_id, (None, None))
+    if in_price is None:
+        # Try stripped name (without provider prefix)
+        stripped = model_id
+        for prefix in MODEL_PROVIDER_PREFIXES:
+            if model_id.startswith(prefix):
+                stripped = model_id[len(prefix):]
+                break
+        in_price, out_price = MODEL_PRICING.get(stripped, (0.10, 0.20))
     return (
         usage.get("prompt_tokens", 0) / 1_000_000 * in_price
         + usage.get("completion_tokens", 0) / 1_000_000 * out_price
@@ -772,9 +834,9 @@ def main() -> None:
     token = os.environ.get("GITHUB_TOKEN", "")
     models_str = os.environ.get(
         "REVIEW_MODELS",
-        "deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash",
+        "nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash",
     )
-    validator_model = os.environ.get("VALIDATOR_MODEL", "deepseek/deepseek-v4-flash")
+    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-v4-flash")
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
 

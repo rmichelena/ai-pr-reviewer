@@ -4,17 +4,17 @@ on:
   workflow_call:
     inputs:
       ai_provider:
-        description: 'LLM provider: openrouter, nvidia, groq, or xai'
+        description: 'Fallback provider for unprefixed model IDs: openrouter, nvidia, groq, or xai'
         type: string
         default: 'openrouter'
       review_models:
-        description: 'Comma-separated model IDs for review passes'
+        description: 'Comma-separated model IDs (prefix: nvidia/, openrouter/, xai/, groq/)'
         type: string
-        default: 'deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash,deepseek/deepseek-v4-flash'
+        default: 'nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash'
       validator_model:
         description: 'Model for validator pass'
         type: string
-        default: 'deepseek/deepseek-v4-flash'
+        default: 'nvidia/deepseek-v4-flash'
       min_votes:
         description: 'Minimum votes to keep a finding'
         type: string
