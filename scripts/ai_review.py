@@ -106,19 +106,24 @@ class Finding:
         fields: dict[str, list[str]] = {}
         current_field: str | None = None
 
+        seen_fields: set[str] = set()
         for line in block.strip().splitlines():
             m = FIELD_RE.match(line)
             if m and m.group(1).strip().lower() in KNOWN_FIELDS:
                 fname = m.group(1).strip().lower()
+                # If we're inside a multi-line text field and this field was
+                # already seen, treat it as continuation text, not a new field
+                if current_field in ("reasoning", "fix", "trace") and fname in seen_fields:
+                    fields[current_field].append(line.strip())
+                    continue
                 current_field = fname
+                seen_fields.add(fname)
                 # Last-wins: replace if field already seen (handles LLM duplicates)
                 fields[fname] = [m.group(2).strip()]
             elif current_field:
-                # Continuation line — but only if it doesn't look like a known field
-                # This prevents continuation lines like "file:: paths..." from
-                # being misinterpreted when they appear inside reasoning/fix text
-                if not FIELD_RE.match(line) or FIELD_RE.match(line).group(1).strip().lower() not in KNOWN_FIELDS:
-                    pass  # don't treat as continuation — ignore stray lines
+                # Skip unknown field-like markers (category:: foo, priority:: bar)
+                if FIELD_RE.match(line) and FIELD_RE.match(line).group(1).strip().lower() not in KNOWN_FIELDS:
+                    continue
                 # Continuation lines appended to current field value
                 if current_field in ("reasoning", "fix", "trace"):
                     fields[current_field].append(line.strip())
@@ -242,16 +247,42 @@ def build_file_line_map(diff: str) -> dict[str, dict[int, int]]:
     return result
 
 
-def normalize_file_path(path: str) -> str:
+def get_known_paths(file_line_map: dict[str, dict[int, int]]) -> set[str]:
+    """Extract the set of file paths from a file_line_map."""
+    return set(file_line_map.keys())
+
+
+def normalize_file_path(path: str, known_paths: set[str] | None = None) -> str:
     """Normalize a file path from LLM output to match diff format.
 
-    Strips surrounding quotes/backticks, then repeatedly removes
-    a/, b/, ./ prefixes until stable.
+    Strips surrounding quotes/backticks, then tries to match against
+    known_paths from the diff. Only strips a/, b/, ./ as fallback.
     """
     path = path.strip()
     # Strip surrounding markdown backticks and quotes
     path = path.strip("`'\"")
-    # Repeatedly strip known prefixes (handles ./b/src/foo.py etc.)
+
+    # If we have known paths, try exact match first
+    if known_paths:
+        if path in known_paths:
+            return path
+        # Try stripping single prefix layer
+        for prefix in ("a/", "b/", "./"):
+            if path.startswith(prefix) and path[len(prefix):] in known_paths:
+                return path[len(prefix):]
+        # Try stripping stacked prefixes
+        stripped = path
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("a/", "b/", "./"):
+                if stripped.startswith(prefix):
+                    stripped = stripped[len(prefix):]
+                    changed = True
+            if stripped in known_paths:
+                return stripped
+
+    # Fallback: strip prefixes (preserves original behavior)
     changed = True
     while changed:
         changed = False
@@ -287,18 +318,29 @@ def extract_file_hunk(diff: str, file_path: str, finding_line: int = 0, context_
 
         # If we know the finding line, center context around it
         if finding_line > 0:
-            # Find the line in the hunk that mentions the target line number
-            # Look for the @@ header or content lines near the finding
+            # Track new_file line number through the hunk to find the
+            # array index closest to finding_line (like build_file_line_map)
             best_idx = 0
+            best_dist = float('inf')
+            cur_new_line = 0
             for i, hline in enumerate(lines):
-                # Check if this hunk line corresponds to the finding line
                 if hline.startswith("@@"):
-                    hm = re.search(r"\+(\d+)", hline)
+                    hm = re.search(r"\+(\d+)(?:,(\d+))?", hline)
                     if hm:
-                        hunk_start = int(hm.group(1))
-                        if abs(hunk_start - finding_line) < context_lines:
-                            best_idx = max(0, i - 5)
-                            break
+                        cur_new_line = int(hm.group(1))
+                    continue
+                if hline.startswith("+") and not hline.startswith("+++"):
+                    dist = abs(cur_new_line - finding_line)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+                    cur_new_line += 1
+                elif hline.startswith(" "):
+                    dist = abs(cur_new_line - finding_line)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = i
+                    cur_new_line += 1
             start = max(0, best_idx - context_lines // 2)
             end = min(len(lines), start + context_lines * 2)
             return "\n".join(lines[start:end])
