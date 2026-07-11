@@ -10,11 +10,11 @@ on:
       review_models:
         description: 'Comma-separated model IDs (prefix: nvidia/, openrouter/, xai/, groq/)'
         type: string
-        default: 'nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash'
+        default: 'nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash'
       validator_model:
         description: 'Model for validator pass'
         type: string
-        default: 'nvidia/deepseek-v4-flash'
+        default: 'nvidia/deepseek-ai/deepseek-v4-flash'
       min_votes:
         description: 'Minimum votes to keep a finding'
         type: string
