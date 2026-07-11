@@ -789,7 +789,7 @@ def run_review_pass(
 
     cost = estimate_cost(model, usage)
     findings = parse_findings(text)
-    print(f"  Found {len(findings)} findings, cost ${cost:.4f}")
+    print(f"  {model}: found {len(findings)} findings, cost ${cost:.4f}")
     return PassResult(findings, usage, cost, model)
 
 
@@ -1010,6 +1010,13 @@ def main() -> None:
         for f in final:
             emoji = severity_emoji.get(f.severity, "⚪")
             body_lines.append(f"| {emoji} {f.severity} | `{f.file}:{f.line}` | {f.title} |")
+    elif all_findings:
+        body_lines.append(
+            "⚠️ Findings were reported by one or more models, but none met "
+            f"the vote threshold ({effective_min_votes}/{successful_passes})."
+        )
+        body_lines.append("")
+        body_lines.append("No inline comments were posted.")
     else:
         body_lines.append("✅ No significant issues found. Code looks good!")
 
