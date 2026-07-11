@@ -854,6 +854,7 @@ def main() -> None:
     validator_model = os.environ.get("VALIDATOR_MODEL", default_model) or default_model
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
+    validator_max_workers = max(1, int(os.environ.get("VALIDATOR_MAX_WORKERS", "2")))
 
     if not event_path:
         print("ERROR: GITHUB_EVENT_PATH not set. This must run in GitHub Actions.")
@@ -961,7 +962,7 @@ def main() -> None:
     findings_list = list(voted.values())
 
     if findings_list:
-        with ThreadPoolExecutor(max_workers=min(len(findings_list), 5)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(findings_list), validator_max_workers)) as pool:
             val_futures = {
                 pool.submit(run_validation, f, diff, validator_model): f
                 for f in findings_list
@@ -975,7 +976,17 @@ def main() -> None:
                     continue
 
                 if vr.error:
-                    print(f"  ⚠️ Validator failed for '{finding.title}', keeping: {vr.error}")
+                    if finding.votes >= 2:
+                        print(
+                            f"  ⚠️ Validator failed for consensus finding '{finding.title}', "
+                            f"keeping: {vr.error}"
+                        )
+                    else:
+                        finding.validated = False
+                        print(
+                            f"  ❌ DISMISSED: validator failed for single-vote finding "
+                            f"'{finding.title}': {vr.error}"
+                        )
                     continue
 
                 total_cost += vr.cost
