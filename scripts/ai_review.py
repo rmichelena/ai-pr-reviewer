@@ -1057,7 +1057,6 @@ def main() -> None:
                 "body": comment_body,
                 "line": f.line,
                 "side": "RIGHT",
-                "subject_type": "line",
             })
         else:
             # Line not in diff range — move to body-only
