@@ -10,11 +10,11 @@ on:
       review_models:
         description: 'Comma-separated model IDs (prefix: nvidia/, openrouter/, xai/, groq/)'
         type: string
-        default: 'nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash'
+        default: 'nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash'
       validator_model:
         description: 'Model for validator pass'
         type: string
-        default: 'nvidia/deepseek-ai/deepseek-v4-flash'
+        default: 'nvidia/deepseek-v4-flash'
       min_votes:
         description: 'Minimum votes to keep a finding'
         type: string
@@ -42,12 +42,12 @@ jobs:
       pull-requests: write
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 

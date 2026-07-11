@@ -843,9 +843,9 @@ def main() -> None:
     token = os.environ.get("GITHUB_TOKEN", "")
     models_str = os.environ.get(
         "REVIEW_MODELS",
-        "nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash",
+        "nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash,nvidia/deepseek-v4-flash",
     )
-    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-ai/deepseek-v4-flash")
+    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-v4-flash")
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
 
