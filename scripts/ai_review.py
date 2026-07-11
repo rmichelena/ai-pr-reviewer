@@ -658,8 +658,13 @@ def post_review(
         json=payload,
         timeout=30,
     )
+    if not r.ok:
+        print(f"  GitHub review API response ({r.status_code}): {r.text[:1000]}")
     r.raise_for_status()
-    print(f"  Posted review with {len(comments)} inline comments")
+    if comments:
+        print(f"  Posted review with {len(comments)} inline comments")
+    else:
+        print("  Posted body-only review")
 
 
 def post_review_with_fallback(
