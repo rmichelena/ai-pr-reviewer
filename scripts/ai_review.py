@@ -841,11 +841,12 @@ def main() -> None:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     event_path = os.environ.get("GITHUB_EVENT_PATH", "")
     token = os.environ.get("GITHUB_TOKEN", "")
+    default_model = "nvidia/deepseek-ai/deepseek-v4-flash"
     models_str = os.environ.get(
         "REVIEW_MODELS",
-        "nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash,nvidia/deepseek-ai/deepseek-v4-flash",
-    )
-    validator_model = os.environ.get("VALIDATOR_MODEL", "nvidia/deepseek-ai/deepseek-v4-flash")
+        f"{default_model},{default_model},{default_model}",
+    ) or f"{default_model},{default_model},{default_model}"
+    validator_model = os.environ.get("VALIDATOR_MODEL", default_model) or default_model
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
     max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
 
@@ -869,6 +870,12 @@ def main() -> None:
     if not models:
         print("ERROR: No models configured in REVIEW_MODELS.")
         sys.exit(1)
+
+    print(f"Configured review models: {', '.join(models)}")
+    print(f"Configured validator model: {validator_model}")
+    for provider_name, provider in PROVIDERS.items():
+        status = "set" if os.environ.get(provider["key_env"], "") else "missing"
+        print(f"Provider key {provider_name} ({provider['key_env']}): {status}")
 
     # --- Fetch diff ---
     diff = fetch_diff(pr_number, repo, token)
