@@ -61,6 +61,13 @@ PROVIDERS = {
         "key_prefix": "Bearer ",
         "extra_headers": {},
     },
+    "zai": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "key_env": "ZAI_API_KEY",
+        "key_header": "Authorization",
+        "key_prefix": "Bearer ",
+        "extra_headers": {},
+    },
 }
 
 # Prefix → provider mapping for auto-detection from model IDs.
@@ -72,6 +79,7 @@ MODEL_PROVIDER_PREFIXES = {
     "openrouter/": "openrouter",
     "xai/": "xai",
     "groq/": "groq",
+    "zai/": "zai",
 }
 
 
