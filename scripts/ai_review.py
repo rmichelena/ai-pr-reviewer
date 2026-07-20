@@ -471,9 +471,11 @@ def call_llm(
     last_error = ""
     for attempt in range(3):
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=120)
+            r = requests.post(url, headers=headers, json=body, timeout=300)
             if r.status_code == 429:
                 wait = _safe_retry_after(r.headers.get("retry-after"))
+                if wait < 10:
+                    wait = 10 + attempt * 10  # minimum 10s, then 20s, 30s
                 # Add jitter to prevent thundering herd with parallel passes
                 wait += random.uniform(0.5, 2.0)
                 last_error = f"HTTP 429 rate limited (retry-after: {r.headers.get('retry-after', 'N/A')})"
