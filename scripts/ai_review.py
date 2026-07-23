@@ -481,7 +481,7 @@ def _safe_retry_after(header_val: str | None) -> int:
         return 5
 
 
-MAX_RETRIES = 5
+MAX_RETRIES = 4
 
 
 def call_llm(
@@ -549,8 +549,8 @@ def call_llm(
                 if r.status_code == 429:
                     wait = _safe_retry_after(r.headers.get("retry-after"))
                     if wait < 10:
-                        # Exponential backoff: 10, 20, 40, 60, 60s
-                        wait = min(10 * (2 ** attempt), 60)
+                        # Exponential backoff: 10, 20, 30, 30s (cap 30)
+                        wait = min(10 * (attempt + 1), 30)
                     wait += random.uniform(0.5, 2.0)
                     last_error = f"HTTP 429 rate limited (retry-after: {r.headers.get('retry-after', 'N/A')})"
                     print(f"  [{current_model}] Rate limited, waiting {wait:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...")
