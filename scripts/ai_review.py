@@ -863,7 +863,7 @@ def main() -> None:
     ) or f"{default_model},{default_model},{default_model}"
     validator_model = os.environ.get("VALIDATOR_MODEL", default_model) or default_model
     min_votes = int(os.environ.get("MIN_VOTES", "2"))
-    max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "5000"))
+    max_diff_lines = int(os.environ.get("MAX_DIFF_LINES", "15000"))
     validator_max_workers = max(1, int(os.environ.get("VALIDATOR_MAX_WORKERS", "2")))
 
     if not event_path:

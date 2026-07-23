@@ -22,7 +22,7 @@ on:
       max_diff_lines:
         description: 'Skip review if diff exceeds this many lines'
         type: string
-        default: '5000'
+        default: '15000'
     secrets:
       OPENROUTER_API_KEY:
         required: false
