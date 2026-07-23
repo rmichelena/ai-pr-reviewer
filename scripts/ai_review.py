@@ -1045,9 +1045,19 @@ def main() -> None:
         return
 
     # --- Majority vote ---
-    effective_min_votes = min(min_votes, successful_passes)
+    # Adaptive threshold: when some models fail, lower the bar proportionally.
+    # With 3/3 models: require min_votes (default 2)
+    # With 2/3 models: require max(1, min_votes - 1) = 1 (any single finding)
+    # With 1/3 models: require 1 (but flag as low-confidence)
+    if successful_passes >= len(models):
+        effective_min_votes = min(min_votes, successful_passes)
+    else:
+        effective_min_votes = max(1, min_votes - (len(models) - successful_passes))
+    low_confidence = successful_passes < len(models)
+
     voted = {k: f for k, f in all_findings.items() if f.votes >= effective_min_votes}
-    print(f"=== Post-vote (≥{effective_min_votes} votes of {successful_passes} successful): {len(voted)} findings ===")
+    confidence_note = " [LOW CONFIDENCE - some models failed]" if low_confidence else ""
+    print(f"=== Post-vote (≥{effective_min_votes} votes of {successful_passes} successful){confidence_note}: {len(voted)} findings ===")
 
     if not voted:
         print("No findings survived majority vote.")
