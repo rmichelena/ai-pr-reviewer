@@ -481,6 +481,9 @@ def _safe_retry_after(header_val: str | None) -> int:
         return 5
 
 
+MAX_RETRIES = 5
+
+
 def call_llm(
     model_id: str,
     system: str,
@@ -488,35 +491,17 @@ def call_llm(
     *,
     max_tokens: int = 8000,
     temperature: float = 0.3,
+    fallback_models: list[str] | None = None,
 ) -> tuple[str, dict[str, int]]:
-    """Call a model via the auto-detected provider.
+    """Call a model via the auto-detected provider with retries and fallback.
 
-    The provider is determined by the model ID prefix:
-      nvidia/...  → NVIDIA NIM
-      openrouter/... → OpenRouter
-      xai/...     → x.ai
-      groq/...    → Groq
-      (unprefixed) → AI_PROVIDER env var (default: openrouter)
+    Tries the primary model first with exponential backoff (5 retries).
+    If all retries fail, tries each model in fallback_models in turn.
 
     Returns (response_text, usage_dict).
-    Raises LLMError if all retries fail.
+    Raises LLMError if all models fail.
     """
-    provider_name, api_model, key_error = resolve_provider(model_id)
-    if key_error:
-        raise LLMError(key_error)
-
-    provider = PROVIDERS[provider_name]
-    key = os.environ.get(provider["key_env"], "")
-
-    url = f"{provider['base_url']}/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        provider["key_header"]: f'{provider["key_prefix"]}{key}',
-        **provider.get("extra_headers", {}),
-    }
-
     body = {
-        "model": api_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -525,36 +510,70 @@ def call_llm(
         "temperature": temperature,
     }
 
+    all_models = [model_id] + (fallback_models or [])
     last_error = ""
-    for attempt in range(3):
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=300)
-            if r.status_code == 429:
-                wait = _safe_retry_after(r.headers.get("retry-after"))
-                if wait < 10:
-                    wait = 10 + attempt * 10  # minimum 10s, then 20s, 30s
-                # Add jitter to prevent thundering herd with parallel passes
-                wait += random.uniform(0.5, 2.0)
-                last_error = f"HTTP 429 rate limited (retry-after: {r.headers.get('retry-after', 'N/A')})"
-                print(f"  Rate limited, waiting {wait:.1f}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            text = data["choices"][0]["message"]["content"]
-            usage = data.get("usage", {})
-            return text, {
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            }
-        except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-            last_error = f"{type(e).__name__}: {e}"
-            print(f"  LLM call attempt {attempt+1} failed: {e}")
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
 
-    raise LLMError(f"Model {model_id} (via {provider_name}) failed after 3 retries: {last_error}")
+    for model_idx, current_model in enumerate(all_models):
+        if model_idx > 0:
+            print(f"  Falling back to '{current_model}'...")
+            provider_name, api_model, key_error = resolve_provider(current_model)
+            if key_error:
+                print(f"  ⚠️ Skipping fallback '{current_model}': {key_error}")
+                continue
+            provider = PROVIDERS[provider_name]
+            key = os.environ.get(provider["key_env"], "")
+            url = f"{provider['base_url']}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                provider["key_header"]: f'{provider["key_prefix"]}{key}',
+                **provider.get("extra_headers", {}),
+            }
+            body["model"] = api_model
+        else:
+            provider_name, api_model, key_error = resolve_provider(current_model)
+            if key_error:
+                raise LLMError(key_error)
+            provider = PROVIDERS[provider_name]
+            key = os.environ.get(provider["key_env"], "")
+            url = f"{provider['base_url']}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                provider["key_header"]: f'{provider["key_prefix"]}{key}',
+                **provider.get("extra_headers", {}),
+            }
+            body["model"] = api_model
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=300)
+                if r.status_code == 429:
+                    wait = _safe_retry_after(r.headers.get("retry-after"))
+                    if wait < 10:
+                        # Exponential backoff: 10, 20, 40, 60, 60s
+                        wait = min(10 * (2 ** attempt), 60)
+                    wait += random.uniform(0.5, 2.0)
+                    last_error = f"HTTP 429 rate limited (retry-after: {r.headers.get('retry-after', 'N/A')})"
+                    print(f"  [{current_model}] Rate limited, waiting {wait:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                text = data["choices"][0]["message"]["content"]
+                usage = data.get("usage", {})
+                return text, {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+            except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+                last_error = f"{type(e).__name__}: {e}"
+                print(f"  [{current_model}] attempt {attempt+1}/{MAX_RETRIES} failed: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(3 * (attempt + 1))
+
+        print(f"  [{current_model}] exhausted {MAX_RETRIES} retries")
+
+    raise LLMError(f"All models failed ({', '.join(all_models)}): {last_error}")
 
 
 FINDING_RE = re.compile(r"===FINDING===(.*?)===END_FINDING===", re.DOTALL)
@@ -899,28 +918,19 @@ def run_validation(
     file_hunk = extract_file_hunk(diff, finding.file, finding_line=finding.line)
     v_prompt = build_validator_prompt(finding, file_hunk)
 
-    models_to_try = [validator_model]
-    if fallback_model and fallback_model != validator_model:
-        models_to_try.append(fallback_model)
+    fallbacks = [fallback_model] if fallback_model and fallback_model != validator_model else None
+    try:
+        v_text, v_usage = call_llm(
+            validator_model, VALIDATOR_SYSTEM, v_prompt,
+            max_tokens=200, fallback_models=fallbacks,
+        )
+    except LLMError as e:
+        return ValidationResult(finding, dismissed=False, error=str(e))
 
-    last_error = None
-    for model in models_to_try:
-        try:
-            v_text, v_usage = call_llm(model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
-            cost = estimate_cost(model, v_usage)
-            m = re.search(r"verdict\s*::\s*(KEEP|DISMISS)", v_text, re.IGNORECASE)
-            if m:
-                dismissed = m.group(1).upper() == "DISMISS"
-            else:
-                dismissed = False
-            return ValidationResult(finding, dismissed=dismissed, usage=v_usage, cost=cost)
-        except LLMError as e:
-            last_error = e
-            if len(models_to_try) > 1:
-                print(f"  ⚠️ Validator '{model}' failed for '{finding.title}', trying fallback...")
-            continue
-
-    return ValidationResult(finding, dismissed=False, error=str(last_error))
+    cost = estimate_cost(validator_model, v_usage)
+    m = re.search(r"verdict\s*::\s*(KEEP|DISMISS)", v_text, re.IGNORECASE)
+    dismissed = m.group(1).upper() == "DISMISS" if m else False
+    return ValidationResult(finding, dismissed=dismissed, usage=v_usage, cost=cost)
 
 
 # ---------------------------------------------------------------------------
