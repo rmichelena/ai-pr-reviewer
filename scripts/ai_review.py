@@ -893,26 +893,34 @@ def run_validation(
     finding: Finding,
     diff: str,
     validator_model: str,
+    fallback_model: str | None = None,
 ) -> ValidationResult:
-    """Validate a single finding. Designed to be called in parallel."""
+    """Validate a single finding. Falls back to alternate model on failure."""
     file_hunk = extract_file_hunk(diff, finding.file, finding_line=finding.line)
     v_prompt = build_validator_prompt(finding, file_hunk)
-    try:
-        v_text, v_usage = call_llm(validator_model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
-    except LLMError as e:
-        return ValidationResult(finding, dismissed=False, error=str(e))
 
-    cost = estimate_cost(validator_model, v_usage)
+    models_to_try = [validator_model]
+    if fallback_model and fallback_model != validator_model:
+        models_to_try.append(fallback_model)
 
-    # Parse verdict line specifically, not substring match
-    m = re.search(r"verdict\s*::\s*(KEEP|DISMISS)", v_text, re.IGNORECASE)
-    if m:
-        dismissed = m.group(1).upper() == "DISMISS"
-    else:
-        # If we can't parse, default to KEEP (safer)
-        dismissed = False
+    last_error = None
+    for model in models_to_try:
+        try:
+            v_text, v_usage = call_llm(model, VALIDATOR_SYSTEM, v_prompt, max_tokens=200)
+            cost = estimate_cost(model, v_usage)
+            m = re.search(r"verdict\s*::\s*(KEEP|DISMISS)", v_text, re.IGNORECASE)
+            if m:
+                dismissed = m.group(1).upper() == "DISMISS"
+            else:
+                dismissed = False
+            return ValidationResult(finding, dismissed=dismissed, usage=v_usage, cost=cost)
+        except LLMError as e:
+            last_error = e
+            if len(models_to_try) > 1:
+                print(f"  ⚠️ Validator '{model}' failed for '{finding.title}', trying fallback...")
+            continue
 
-    return ValidationResult(finding, dismissed=dismissed, usage=v_usage, cost=cost)
+    return ValidationResult(finding, dismissed=False, error=str(last_error))
 
 
 # ---------------------------------------------------------------------------
@@ -1065,10 +1073,20 @@ def main() -> None:
     # --- Validator pass (parallelized) ---
     findings_list = list(voted.values())
 
+    # Validator fallback: use a different provider if the primary validator fails
+    validator_fallback = os.environ.get("VALIDATOR_FALLBACK_MODEL", "")
+    if not validator_fallback:
+        # Auto-pick a fallback from a different provider than the primary validator
+        for m in models:
+            if m != validator_model:
+                validator_fallback = m
+                break
+
     if findings_list:
+        print(f"Validator: {validator_model}" + (f" (fallback: {validator_fallback})" if validator_fallback else ""))
         with ThreadPoolExecutor(max_workers=min(len(findings_list), validator_max_workers)) as pool:
             val_futures = {
-                pool.submit(run_validation, f, diff, validator_model): f
+                pool.submit(run_validation, f, diff, validator_model, validator_fallback): f
                 for f in findings_list
             }
             for future in as_completed(val_futures):
@@ -1080,17 +1098,11 @@ def main() -> None:
                     continue
 
                 if vr.error:
-                    if finding.votes >= 2:
-                        print(
-                            f"  ⚠️ Validator failed for consensus finding '{finding.title}', "
-                            f"keeping: {vr.error}"
-                        )
-                    else:
-                        finding.validated = False
-                        print(
-                            f"  ❌ DISMISSED: validator failed for single-vote finding "
-                            f"'{finding.title}': {vr.error}"
-                        )
+                    # Validator failed (including fallback) — fail-open: keep the finding
+                    print(
+                        f"  ⚠️ Validator failed for '{finding.title}', "
+                        f"keeping (fail-open): {vr.error}"
+                    )
                     continue
 
                 total_cost += vr.cost
